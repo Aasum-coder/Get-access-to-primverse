@@ -1,0 +1,290 @@
+# ============================================================================
+# SYSTM8 Nightly Bug Triage Agent
+# ============================================================================
+# Runs nightly at 02:00 UTC (and manual dispatch). Reads new bugs and failed
+# tests from Supabase, generates Claude Code-ready prompts, and creates
+# GitHub Issues labeled by severity so you can copy/paste each morning.
+# ============================================================================
+
+name: "SYSTM8 Nightly Bug Triage"
+
+on:
+  schedule:
+    - cron: "0 2 * * *" # Every night at 02:00 UTC
+  workflow_dispatch: # Allow manual trigger
+
+permissions:
+  issues: write
+
+env:
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+  TRIAGE_SECRET: ${{ secrets.TRIAGE_SECRET }}
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Step 0 — Ensure required GitHub labels exist
+  # --------------------------------------------------------------------------
+  ensure-labels:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create triage labels (idempotent)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REPO="${{ github.repository }}"
+
+          create_label() {
+            local name="$1" color="$2" description="$3"
+            gh label create "$name" \
+              --repo "$REPO" \
+              --color "$color" \
+              --description "$description" \
+              --force 2>/dev/null || true
+          }
+
+          create_label "bug-critical"  "d73a4a" "Critical severity bug — blocks core functionality"
+          create_label "bug-major"     "e99d42" "Major severity bug — significant user impact"
+          create_label "bug-minor"     "fbca04" "Minor severity bug — small user impact"
+          create_label "bug-cosmetic"  "7b61ff" "Cosmetic bug — visual/UX polish"
+          create_label "auto-triage"   "0075ca" "Automatically triaged by nightly agent"
+          create_label "agent-ready"   "0e8a16" "Ready for Claude Code agent — prompt included"
+
+  # --------------------------------------------------------------------------
+  # Step 1 — Fetch, triage, and create issues
+  # --------------------------------------------------------------------------
+  triage:
+    needs: ensure-labels
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run bug triage agent
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REPO="${{ github.repository }}"
+
+          # ----------------------------------------------------------------
+          # Helper: Supabase REST GET
+          # ----------------------------------------------------------------
+          supabase_get() {
+            local table="$1" query="$2"
+            curl -sf \
+              "${SUPABASE_URL}/rest/v1/${table}?${query}" \
+              -H "apikey: ${SUPABASE_SERVICE_KEY}" \
+              -H "Authorization: Bearer ${SUPABASE_SERVICE_KEY}" \
+              -H "Content-Type: application/json"
+          }
+
+          # ----------------------------------------------------------------
+          # Helper: Supabase REST PATCH
+          # ----------------------------------------------------------------
+          supabase_patch() {
+            local table="$1" query="$2" body="$3"
+            curl -sf -X PATCH \
+              "${SUPABASE_URL}/rest/v1/${table}?${query}" \
+              -H "apikey: ${SUPABASE_SERVICE_KEY}" \
+              -H "Authorization: Bearer ${SUPABASE_SERVICE_KEY}" \
+              -H "Content-Type: application/json" \
+              -H "Prefer: return=minimal" \
+              -d "$body"
+          }
+
+          # ----------------------------------------------------------------
+          # Helper: Guess the likely file from keywords
+          # ----------------------------------------------------------------
+          guess_file() {
+            local text
+            text=$(echo "$1" | tr '[:upper:]' '[:lower:]')
+
+            if echo "$text" | grep -qE "landing|slug"; then
+              echo "app/[slug]/page.tsx"
+            elif echo "$text" | grep -qE "email|mail"; then
+              echo "app/api/ (email routes)"
+            elif echo "$text" | grep -qE "login|signup"; then
+              echo "app/login/page.tsx"
+            elif echo "$text" | grep -qE "bio|groq"; then
+              echo "app/api/generate-bio/route.ts"
+            elif echo "$text" | grep -qE "share"; then
+              echo "app/page.tsx (share section)"
+            elif echo "$text" | grep -qE "language|translat"; then
+              echo "translations in relevant page files"
+            else
+              echo "app/page.tsx"
+            fi
+          }
+
+          # ----------------------------------------------------------------
+          # Helper: Build a Claude Code prompt
+          # ----------------------------------------------------------------
+          build_prompt() {
+            local title="$1" severity="$2" description="$3" likely_file="$4"
+            cat <<PROMPT
+          ## Claude Code Agent Prompt
+
+          **Bug:** ${title}
+          **Severity:** ${severity}
+          **Likely file:** ${likely_file}
+
+          ### Description
+          ${description}
+
+          ### Fix Instructions
+          1. Open \`${likely_file}\` and locate the code related to: ${title}
+          2. Reproduce the issue by reading the logic path described above.
+          3. Implement the fix — keep it minimal and targeted.
+          4. **Constraints (MUST follow):**
+             - Do NOT break any existing functionality.
+             - Support all 9 languages (no, en, es, fr, de, pt, zh, ar, hi).
+             - Maintain the dark/gold theme throughout.
+             - Preserve mobile responsiveness on all viewports.
+          5. Run the build (\`npm run build\`) and verify zero errors.
+          6. If tests exist for the affected area, run them and confirm they pass.
+
+          > Copy this entire prompt into Claude Code to begin the fix.
+          PROMPT
+          }
+
+          # ----------------------------------------------------------------
+          # Helper: Check for duplicate issue (dedup by title prefix)
+          # ----------------------------------------------------------------
+          issue_exists() {
+            local title="$1"
+            local count
+            count=$(gh issue list --repo "$REPO" --state open --search "$title" --json title \
+                    | jq --arg t "$title" '[.[] | select(.title == $t)] | length')
+            [ "$count" -gt 0 ]
+          }
+
+          # ----------------------------------------------------------------
+          # 1. Fetch new bug reports for systm8
+          # ----------------------------------------------------------------
+          echo "::group::Fetching new bug reports"
+          BUGS=$(supabase_get "bug_reports" "status=eq.new&platform=eq.systm8&select=id,title,severity,description")
+          BUG_COUNT=$(echo "$BUGS" | jq 'length')
+          echo "Found ${BUG_COUNT} new bug(s)"
+          echo "::endgroup::"
+
+          # ----------------------------------------------------------------
+          # 2. Fetch failed test results
+          # ----------------------------------------------------------------
+          echo "::group::Fetching failed test results"
+          FAILURES=$(supabase_get "test_results" "status=eq.fail&select=id,test_item,error_message,severity")
+          FAIL_COUNT=$(echo "$FAILURES" | jq 'length')
+          echo "Found ${FAIL_COUNT} failed test(s)"
+          echo "::endgroup::"
+
+          # ----------------------------------------------------------------
+          # 3. Group test failures by test_item
+          # ----------------------------------------------------------------
+          echo "::group::Grouping test failures"
+          GROUPED_FAILURES=$(echo "$FAILURES" | jq '
+            group_by(.test_item)
+            | map({
+                test_item: .[0].test_item,
+                severity: (map(.severity) | sort | first),
+                count: length,
+                errors: map(.error_message) | unique,
+                ids: map(.id)
+              })
+          ')
+          GROUP_COUNT=$(echo "$GROUPED_FAILURES" | jq 'length')
+          echo "Grouped into ${GROUP_COUNT} unique failure(s)"
+          echo "::endgroup::"
+
+          CREATED=0
+          SKIPPED=0
+
+          # ----------------------------------------------------------------
+          # 4. Process bug reports → GitHub Issues
+          # ----------------------------------------------------------------
+          echo "::group::Processing bug reports"
+          for i in $(seq 0 $((BUG_COUNT - 1))); do
+            BUG=$(echo "$BUGS" | jq ".[$i]")
+            BUG_ID=$(echo "$BUG" | jq -r '.id')
+            TITLE=$(echo "$BUG" | jq -r '.title')
+            SEVERITY=$(echo "$BUG" | jq -r '.severity // "minor"')
+            DESCRIPTION=$(echo "$BUG" | jq -r '.description // "No description provided."')
+
+            ISSUE_TITLE="[BUG] ${TITLE}"
+            LIKELY_FILE=$(guess_file "$TITLE $DESCRIPTION")
+
+            # Dedup check
+            if issue_exists "$ISSUE_TITLE"; then
+              echo "⏭  Skipping duplicate: ${ISSUE_TITLE}"
+              SKIPPED=$((SKIPPED + 1))
+              continue
+            fi
+
+            BODY=$(build_prompt "$TITLE" "$SEVERITY" "$DESCRIPTION" "$LIKELY_FILE")
+
+            gh issue create \
+              --repo "$REPO" \
+              --title "$ISSUE_TITLE" \
+              --body "$BODY" \
+              --label "bug-${SEVERITY},auto-triage,agent-ready"
+
+            echo "Created issue: ${ISSUE_TITLE}"
+            CREATED=$((CREATED + 1))
+
+            # Mark bug as triaging in Supabase
+            supabase_patch "bug_reports" "id=eq.${BUG_ID}" '{"status":"triaging"}'
+          done
+          echo "::endgroup::"
+
+          # ----------------------------------------------------------------
+          # 5. Process grouped test failures → GitHub Issues
+          # ----------------------------------------------------------------
+          echo "::group::Processing test failures"
+          for i in $(seq 0 $((GROUP_COUNT - 1))); do
+            GROUP=$(echo "$GROUPED_FAILURES" | jq ".[$i]")
+            TEST_ITEM=$(echo "$GROUP" | jq -r '.test_item')
+            SEVERITY=$(echo "$GROUP" | jq -r '.severity // "minor"')
+            FAIL_N=$(echo "$GROUP" | jq -r '.count')
+            ERRORS=$(echo "$GROUP" | jq -r '.errors | join("\n- ")')
+
+            ISSUE_TITLE="[TEST FAIL] ${TEST_ITEM}"
+            LIKELY_FILE=$(guess_file "$TEST_ITEM $ERRORS")
+
+            DESCRIPTION="**${FAIL_N} failure(s)** in test item \`${TEST_ITEM}\`.
+
+          **Error(s):**
+          - ${ERRORS}"
+
+            # Dedup check
+            if issue_exists "$ISSUE_TITLE"; then
+              echo "⏭  Skipping duplicate: ${ISSUE_TITLE}"
+              SKIPPED=$((SKIPPED + 1))
+              continue
+            fi
+
+            BODY=$(build_prompt "$TEST_ITEM" "$SEVERITY" "$DESCRIPTION" "$LIKELY_FILE")
+
+            gh issue create \
+              --repo "$REPO" \
+              --title "$ISSUE_TITLE" \
+              --body "$BODY" \
+              --label "bug-${SEVERITY},auto-triage,agent-ready"
+
+            echo "Created issue: ${ISSUE_TITLE}"
+            CREATED=$((CREATED + 1))
+          done
+          echo "::endgroup::"
+
+          # ----------------------------------------------------------------
+          # Summary
+          # ----------------------------------------------------------------
+          echo ""
+          echo "========================================"
+          echo " SYSTM8 Nightly Triage Complete"
+          echo "========================================"
+          echo " Bugs fetched:      ${BUG_COUNT}"
+          echo " Test groups:       ${GROUP_COUNT}"
+          echo " Issues created:    ${CREATED}"
+          echo " Duplicates skipped: ${SKIPPED}"
+          echo "========================================"
