@@ -60,82 +60,87 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Run bug triage agent
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # ----------------------------------------------------------------
+      # Step 1 — Fetch data from Supabase and write to temp files
+      # ----------------------------------------------------------------
+      - name: Fetch bugs and test failures from Supabase
         shell: bash
         run: |
           set -euo pipefail
 
-          REPO="${{ github.repository }}"
+          echo "::group::Fetching new bug reports"
+          BUGS=$(curl -sf \
+            "${SUPABASE_URL}/rest/v1/bug_reports?status=eq.new&platform=eq.systm8&select=id,title,severity,description" \
+            -H "apikey: ${SUPABASE_SERVICE_KEY}" \
+            -H "Authorization: Bearer ${SUPABASE_SERVICE_KEY}" \
+            -H "Content-Type: application/json")
+          echo "$BUGS" > /tmp/bugs.json
+          echo "Fetched $(echo "$BUGS" | jq 'length') bug(s)"
+          echo "::endgroup::"
 
-          # ----------------------------------------------------------------
-          # Helper: Supabase REST GET
-          # ----------------------------------------------------------------
-          supabase_get() {
-            local table="$1" query="$2"
-            curl -sf \
-              "${SUPABASE_URL}/rest/v1/${table}?${query}" \
-              -H "apikey: ${SUPABASE_SERVICE_KEY}" \
-              -H "Authorization: Bearer ${SUPABASE_SERVICE_KEY}" \
-              -H "Content-Type: application/json"
+          echo "::group::Fetching failed test results"
+          FAILS=$(curl -sf \
+            "${SUPABASE_URL}/rest/v1/test_results?status=eq.fail&select=id,test_item,error_message,severity" \
+            -H "apikey: ${SUPABASE_SERVICE_KEY}" \
+            -H "Authorization: Bearer ${SUPABASE_SERVICE_KEY}" \
+            -H "Content-Type: application/json")
+          echo "$FAILS" > /tmp/fails.json
+          echo "Fetched $(echo "$FAILS" | jq 'length') failure(s)"
+          echo "::endgroup::"
+
+      # ----------------------------------------------------------------
+      # Step 2 — Process data and create GitHub Issues (Node)
+      # ----------------------------------------------------------------
+      - name: Triage bugs and create issues
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          node << 'NODESCRIPT'
+          const fs = require('fs');
+          const { execSync } = require('child_process');
+
+          // ---------------------------------------------------------------
+          // Read fetched data from temp files
+          // ---------------------------------------------------------------
+          let bugs = [];
+          let fails = [];
+          try { bugs = JSON.parse(fs.readFileSync('/tmp/bugs.json', 'utf8')); } catch(e) { bugs = []; }
+          try { fails = JSON.parse(fs.readFileSync('/tmp/fails.json', 'utf8')); } catch(e) { fails = []; }
+
+          const REPO = process.env.GITHUB_REPOSITORY;
+          const SUPABASE_URL = process.env.SUPABASE_URL;
+          const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
+
+          // ---------------------------------------------------------------
+          // Helper: guess likely file from keywords
+          // ---------------------------------------------------------------
+          function guessFile(text) {
+            const t = (text || '').toLowerCase();
+            if (/landing|slug/.test(t))       return 'app/[slug]/page.tsx';
+            if (/email|mail/.test(t))         return 'app/api/ (email routes)';
+            if (/login|signup/.test(t))       return 'app/login/page.tsx';
+            if (/bio|groq/.test(t))           return 'app/api/generate-bio/route.ts';
+            if (/share/.test(t))              return 'app/page.tsx (share section)';
+            if (/language|translat/.test(t))  return 'translations in relevant page files';
+            return 'app/page.tsx';
           }
 
-          # ----------------------------------------------------------------
-          # Helper: Supabase REST PATCH
-          # ----------------------------------------------------------------
-          supabase_patch() {
-            local table="$1" query="$2" body="$3"
-            curl -sf -X PATCH \
-              "${SUPABASE_URL}/rest/v1/${table}?${query}" \
-              -H "apikey: ${SUPABASE_SERVICE_KEY}" \
-              -H "Authorization: Bearer ${SUPABASE_SERVICE_KEY}" \
-              -H "Content-Type: application/json" \
-              -H "Prefer: return=minimal" \
-              -d "$body"
-          }
-
-          # ----------------------------------------------------------------
-          # Helper: Guess the likely file from keywords
-          # ----------------------------------------------------------------
-          guess_file() {
-            local text
-            text=$(echo "$1" | tr '[:upper:]' '[:lower:]')
-
-            if echo "$text" | grep -qE "landing|slug"; then
-              echo "app/[slug]/page.tsx"
-            elif echo "$text" | grep -qE "email|mail"; then
-              echo "app/api/ (email routes)"
-            elif echo "$text" | grep -qE "login|signup"; then
-              echo "app/login/page.tsx"
-            elif echo "$text" | grep -qE "bio|groq"; then
-              echo "app/api/generate-bio/route.ts"
-            elif echo "$text" | grep -qE "share"; then
-              echo "app/page.tsx (share section)"
-            elif echo "$text" | grep -qE "language|translat"; then
-              echo "translations in relevant page files"
-            else
-              echo "app/page.tsx"
-            fi
-          }
-
-          # ----------------------------------------------------------------
-          # Helper: Build a Claude Code prompt
-          # ----------------------------------------------------------------
-          build_prompt() {
-            local title="$1" severity="$2" description="$3" likely_file="$4"
-            cat <<PROMPT
-          ## Claude Code Agent Prompt
+          // ---------------------------------------------------------------
+          // Helper: build Claude Code prompt
+          // ---------------------------------------------------------------
+          function buildPrompt(title, severity, description, likelyFile) {
+            return `## Claude Code Agent Prompt
 
           **Bug:** ${title}
           **Severity:** ${severity}
-          **Likely file:** ${likely_file}
+          **Likely file:** ${likelyFile}
 
           ### Description
           ${description}
 
           ### Fix Instructions
-          1. Open \`${likely_file}\` and locate the code related to: ${title}
+          1. Open \`${likelyFile}\` and locate the code related to: ${title}
           2. Reproduce the issue by reading the logic path described above.
           3. Implement the fix — keep it minimal and targeted.
           4. **Constraints (MUST follow):**
@@ -143,148 +148,128 @@ jobs:
              - Support all 9 languages (no, en, es, fr, de, pt, zh, ar, hi).
              - Maintain the dark/gold theme throughout.
              - Preserve mobile responsiveness on all viewports.
-          5. Run the build (\`npm run build\`) and verify zero errors.
+          5. Run the build (\\\`npm run build\\\`) and verify zero errors.
           6. If tests exist for the affected area, run them and confirm they pass.
 
-          > Copy this entire prompt into Claude Code to begin the fix.
-          PROMPT
+          > Copy this entire prompt into Claude Code to begin the fix.`;
           }
 
-          # ----------------------------------------------------------------
-          # Helper: Check for duplicate issue (dedup by title prefix)
-          # ----------------------------------------------------------------
-          issue_exists() {
-            local title="$1"
-            local count
-            count=$(gh issue list --repo "$REPO" --state open --search "$title" --json title \
-                    | jq --arg t "$title" '[.[] | select(.title == $t)] | length')
-            [ "$count" -gt 0 ]
+          // ---------------------------------------------------------------
+          // Helper: check if an open issue with exact title already exists
+          // ---------------------------------------------------------------
+          function issueExists(title) {
+            try {
+              const out = execSync(
+                `gh issue list --repo "${REPO}" --state open --search "${title.replace(/"/g, '\\"')}" --json title`,
+                { encoding: 'utf8' }
+              );
+              const issues = JSON.parse(out);
+              return issues.some(i => i.title === title);
+            } catch {
+              return false;
+            }
           }
 
-          # ----------------------------------------------------------------
-          # 1. Fetch new bug reports for systm8
-          # ----------------------------------------------------------------
-          echo "::group::Fetching new bug reports"
-          BUGS=$(supabase_get "bug_reports" "status=eq.new&platform=eq.systm8&select=id,title,severity,description")
-          BUG_COUNT=$(echo "$BUGS" | jq 'length')
-          echo "Found ${BUG_COUNT} new bug(s)"
-          echo "::endgroup::"
+          // ---------------------------------------------------------------
+          // Helper: create a GitHub issue
+          // ---------------------------------------------------------------
+          function createIssue(title, body, labels) {
+            const tmpBody = '/tmp/issue_body.md';
+            fs.writeFileSync(tmpBody, body);
+            execSync(
+              `gh issue create --repo "${REPO}" --title "${title.replace(/"/g, '\\"')}" --body-file "${tmpBody}" --label "${labels}"`,
+              { stdio: 'inherit' }
+            );
+          }
 
-          # ----------------------------------------------------------------
-          # 2. Fetch failed test results
-          # ----------------------------------------------------------------
-          echo "::group::Fetching failed test results"
-          FAILURES=$(supabase_get "test_results" "status=eq.fail&select=id,test_item,error_message,severity")
-          FAIL_COUNT=$(echo "$FAILURES" | jq 'length')
-          echo "Found ${FAIL_COUNT} failed test(s)"
-          echo "::endgroup::"
+          // ---------------------------------------------------------------
+          // Helper: PATCH a Supabase row
+          // ---------------------------------------------------------------
+          function supabasePatch(table, query, body) {
+            try {
+              execSync(`curl -sf -X PATCH \
+                "${SUPABASE_URL}/rest/v1/${table}?${query}" \
+                -H "apikey: ${SUPABASE_SERVICE_KEY}" \
+                -H "Authorization: Bearer ${SUPABASE_SERVICE_KEY}" \
+                -H "Content-Type: application/json" \
+                -H "Prefer: return=minimal" \
+                -d '${JSON.stringify(body)}'`, { stdio: 'inherit' });
+            } catch { /* best-effort */ }
+          }
 
-          # ----------------------------------------------------------------
-          # 3. Group test failures by test_item
-          # ----------------------------------------------------------------
-          echo "::group::Grouping test failures"
-          GROUPED_FAILURES=$(echo "$FAILURES" | jq '
-            group_by(.test_item)
-            | map({
-                test_item: .[0].test_item,
-                severity: (map(.severity) | sort | first),
-                count: length,
-                errors: map(.error_message) | unique,
-                ids: map(.id)
-              })
-          ')
-          GROUP_COUNT=$(echo "$GROUPED_FAILURES" | jq 'length')
-          echo "Grouped into ${GROUP_COUNT} unique failure(s)"
-          echo "::endgroup::"
+          // ---------------------------------------------------------------
+          // 1. Process bug reports
+          // ---------------------------------------------------------------
+          let created = 0;
+          let skipped = 0;
 
-          CREATED=0
-          SKIPPED=0
+          console.log(`\n--- Processing ${bugs.length} bug report(s) ---`);
+          for (const bug of bugs) {
+            const title = `[BUG] ${bug.title}`;
+            const severity = bug.severity || 'minor';
+            const description = bug.description || 'No description provided.';
+            const likelyFile = guessFile(`${bug.title} ${description}`);
 
-          # ----------------------------------------------------------------
-          # 4. Process bug reports → GitHub Issues
-          # ----------------------------------------------------------------
-          echo "::group::Processing bug reports"
-          for i in $(seq 0 $((BUG_COUNT - 1))); do
-            BUG=$(echo "$BUGS" | jq ".[$i]")
-            BUG_ID=$(echo "$BUG" | jq -r '.id')
-            TITLE=$(echo "$BUG" | jq -r '.title')
-            SEVERITY=$(echo "$BUG" | jq -r '.severity // "minor"')
-            DESCRIPTION=$(echo "$BUG" | jq -r '.description // "No description provided."')
+            if (issueExists(title)) {
+              console.log(`Skipping duplicate: ${title}`);
+              skipped++;
+              continue;
+            }
 
-            ISSUE_TITLE="[BUG] ${TITLE}"
-            LIKELY_FILE=$(guess_file "$TITLE $DESCRIPTION")
+            const body = buildPrompt(bug.title, severity, description, likelyFile);
+            createIssue(title, body, `bug-${severity},auto-triage,agent-ready`);
+            console.log(`Created issue: ${title}`);
+            created++;
 
-            # Dedup check
-            if issue_exists "$ISSUE_TITLE"; then
-              echo "⏭  Skipping duplicate: ${ISSUE_TITLE}"
-              SKIPPED=$((SKIPPED + 1))
-              continue
-            fi
+            supabasePatch('bug_reports', `id=eq.${bug.id}`, { status: 'triaging' });
+          }
 
-            BODY=$(build_prompt "$TITLE" "$SEVERITY" "$DESCRIPTION" "$LIKELY_FILE")
+          // ---------------------------------------------------------------
+          // 2. Group test failures by test_item
+          // ---------------------------------------------------------------
+          const groups = {};
+          for (const f of fails) {
+            const key = f.test_item || 'unknown';
+            if (!groups[key]) {
+              groups[key] = { test_item: key, severity: f.severity || 'minor', count: 0, errors: new Set(), ids: [] };
+            }
+            groups[key].count++;
+            if (f.error_message) groups[key].errors.add(f.error_message);
+            groups[key].ids.push(f.id);
+          }
 
-            gh issue create \
-              --repo "$REPO" \
-              --title "$ISSUE_TITLE" \
-              --body "$BODY" \
-              --label "bug-${SEVERITY},auto-triage,agent-ready"
+          const grouped = Object.values(groups);
+          console.log(`\n--- Processing ${grouped.length} grouped test failure(s) ---`);
 
-            echo "Created issue: ${ISSUE_TITLE}"
-            CREATED=$((CREATED + 1))
+          for (const g of grouped) {
+            const title = `[TEST FAIL] ${g.test_item}`;
+            const severity = g.severity;
+            const errors = [...g.errors].join('\n- ');
+            const description = `**${g.count} failure(s)** in test item \`${g.test_item}\`.\n\n**Error(s):**\n- ${errors}`;
+            const likelyFile = guessFile(`${g.test_item} ${errors}`);
 
-            # Mark bug as triaging in Supabase
-            supabase_patch "bug_reports" "id=eq.${BUG_ID}" '{"status":"triaging"}'
-          done
-          echo "::endgroup::"
+            if (issueExists(title)) {
+              console.log(`Skipping duplicate: ${title}`);
+              skipped++;
+              continue;
+            }
 
-          # ----------------------------------------------------------------
-          # 5. Process grouped test failures → GitHub Issues
-          # ----------------------------------------------------------------
-          echo "::group::Processing test failures"
-          for i in $(seq 0 $((GROUP_COUNT - 1))); do
-            GROUP=$(echo "$GROUPED_FAILURES" | jq ".[$i]")
-            TEST_ITEM=$(echo "$GROUP" | jq -r '.test_item')
-            SEVERITY=$(echo "$GROUP" | jq -r '.severity // "minor"')
-            FAIL_N=$(echo "$GROUP" | jq -r '.count')
-            ERRORS=$(echo "$GROUP" | jq -r '.errors | join("\n- ")')
+            const body = buildPrompt(g.test_item, severity, description, likelyFile);
+            createIssue(title, body, `bug-${severity},auto-triage,agent-ready`);
+            console.log(`Created issue: ${title}`);
+            created++;
+          }
 
-            ISSUE_TITLE="[TEST FAIL] ${TEST_ITEM}"
-            LIKELY_FILE=$(guess_file "$TEST_ITEM $ERRORS")
-
-            DESCRIPTION="**${FAIL_N} failure(s)** in test item \`${TEST_ITEM}\`.
-
-          **Error(s):**
-          - ${ERRORS}"
-
-            # Dedup check
-            if issue_exists "$ISSUE_TITLE"; then
-              echo "⏭  Skipping duplicate: ${ISSUE_TITLE}"
-              SKIPPED=$((SKIPPED + 1))
-              continue
-            fi
-
-            BODY=$(build_prompt "$TEST_ITEM" "$SEVERITY" "$DESCRIPTION" "$LIKELY_FILE")
-
-            gh issue create \
-              --repo "$REPO" \
-              --title "$ISSUE_TITLE" \
-              --body "$BODY" \
-              --label "bug-${SEVERITY},auto-triage,agent-ready"
-
-            echo "Created issue: ${ISSUE_TITLE}"
-            CREATED=$((CREATED + 1))
-          done
-          echo "::endgroup::"
-
-          # ----------------------------------------------------------------
-          # Summary
-          # ----------------------------------------------------------------
-          echo ""
-          echo "========================================"
-          echo " SYSTM8 Nightly Triage Complete"
-          echo "========================================"
-          echo " Bugs fetched:      ${BUG_COUNT}"
-          echo " Test groups:       ${GROUP_COUNT}"
-          echo " Issues created:    ${CREATED}"
-          echo " Duplicates skipped: ${SKIPPED}"
-          echo "========================================"
+          // ---------------------------------------------------------------
+          // Summary
+          // ---------------------------------------------------------------
+          console.log(`
+          ========================================
+           SYSTM8 Nightly Triage Complete
+          ========================================
+           Bugs fetched:       ${bugs.length}
+           Test groups:        ${grouped.length}
+           Issues created:     ${created}
+           Duplicates skipped: ${skipped}
+          ========================================`);
+          NODESCRIPT
