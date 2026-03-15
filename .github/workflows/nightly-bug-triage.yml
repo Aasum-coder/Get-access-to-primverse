@@ -1,17 +1,16 @@
 # ============================================================================
 # SYSTM8 Nightly Bug Triage Agent
 # ============================================================================
-# Runs nightly at 02:00 UTC (and manual dispatch). Reads new bugs and failed
-# tests from Supabase, generates Claude Code-ready prompts, and creates
-# GitHub Issues labeled by severity so you can copy/paste each morning.
+# Runs nightly at 02:00 UTC (+ manual dispatch). Fetches new bugs and failed
+# tests from Supabase, generates Claude Code prompts, creates GitHub Issues.
 # ============================================================================
 
 name: "SYSTM8 Nightly Bug Triage"
 
 on:
   schedule:
-    - cron: "0 2 * * *" # Every night at 02:00 UTC
-  workflow_dispatch: # Allow manual trigger
+    - cron: "0 2 * * *"
+  workflow_dispatch:
 
 permissions:
   issues: write
@@ -20,38 +19,32 @@ env:
   SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
   SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
   TRIAGE_SECRET: ${{ secrets.TRIAGE_SECRET }}
+  PLATFORM: ${{ secrets.PLATFORM }}
 
 jobs:
   # --------------------------------------------------------------------------
-  # Step 0 — Ensure required GitHub labels exist
+  # Job 1 — Ensure GitHub labels exist
   # --------------------------------------------------------------------------
   ensure-labels:
     runs-on: ubuntu-latest
     steps:
-      - name: Create triage labels (idempotent)
+      - name: Create triage labels
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           REPO="${{ github.repository }}"
-
           create_label() {
-            local name="$1" color="$2" description="$3"
-            gh label create "$name" \
-              --repo "$REPO" \
-              --color "$color" \
-              --description "$description" \
-              --force 2>/dev/null || true
+            gh label create "$1" --repo "$REPO" --color "$2" --description "$3" --force 2>/dev/null || true
           }
-
-          create_label "bug-critical"  "d73a4a" "Critical severity bug — blocks core functionality"
-          create_label "bug-major"     "e99d42" "Major severity bug — significant user impact"
-          create_label "bug-minor"     "fbca04" "Minor severity bug — small user impact"
-          create_label "bug-cosmetic"  "7b61ff" "Cosmetic bug — visual/UX polish"
-          create_label "auto-triage"   "0075ca" "Automatically triaged by nightly agent"
-          create_label "agent-ready"   "0e8a16" "Ready for Claude Code agent — prompt included"
+          create_label "bug-critical" "d73a4a" "Critical severity bug"
+          create_label "bug-major"    "e99d42" "Major severity bug"
+          create_label "bug-minor"    "fbca04" "Minor severity bug"
+          create_label "bug-cosmetic" "7b61ff" "Cosmetic bug"
+          create_label "auto-triage"  "0075ca" "Auto-triaged by nightly agent"
+          create_label "agent-ready"  "0e8a16" "Ready for Claude Code agent"
 
   # --------------------------------------------------------------------------
-  # Step 1 — Fetch, triage, and create issues
+  # Job 2 — Fetch from Supabase, triage, create issues
   # --------------------------------------------------------------------------
   triage:
     needs: ensure-labels
@@ -61,35 +54,76 @@ jobs:
         uses: actions/checkout@v4
 
       # ----------------------------------------------------------------
-      # Step 1 — Fetch data from Supabase and write to temp files
+      # Step 1: Debug connectivity + fetch data to temp files
       # ----------------------------------------------------------------
-      - name: Fetch bugs and test failures from Supabase
+      - name: Fetch bugs and failures from Supabase
         shell: bash
         run: |
-          set -euo pipefail
+          echo "=== DEBUG: curl version ==="
+          curl --version
 
-          echo "::group::Fetching new bug reports"
-          BUGS=$(curl -sf \
+          echo ""
+          echo "=== DEBUG: Testing Supabase connectivity ==="
+          echo "SUPABASE_URL is: ${SUPABASE_URL:-(empty!)}"
+          echo "SUPABASE_SERVICE_KEY length: ${#SUPABASE_SERVICE_KEY} chars"
+          echo "Testing connection..."
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            "${SUPABASE_URL}/rest/v1/" \
+            -H "apikey: ${SUPABASE_SERVICE_KEY}" || echo "CURL_FAILED")
+          echo "Connectivity test HTTP code: ${HTTP_CODE}"
+          echo ""
+
+          # --- Fetch bug reports ---
+          echo "=== Fetching bug_reports (status=new, platform=systm8) ==="
+          BUGS=$(curl -s -w "\n%{http_code}" \
             "${SUPABASE_URL}/rest/v1/bug_reports?status=eq.new&platform=eq.systm8&select=id,title,severity,description" \
             -H "apikey: ${SUPABASE_SERVICE_KEY}" \
             -H "Authorization: Bearer ${SUPABASE_SERVICE_KEY}" \
-            -H "Content-Type: application/json")
-          echo "$BUGS" > /tmp/bugs.json
-          echo "Fetched $(echo "$BUGS" | jq 'length') bug(s)"
-          echo "::endgroup::"
+            -H "Content-Type: application/json" || true)
 
-          echo "::group::Fetching failed test results"
-          FAILS=$(curl -sf \
+          BUGS_HTTP=$(echo "$BUGS" | tail -1)
+          BUGS_BODY=$(echo "$BUGS" | sed '$d')
+
+          echo "BUGS HTTP status: ${BUGS_HTTP}"
+          echo "BUGS response: ${BUGS_BODY}"
+
+          if [ -z "$BUGS_BODY" ] || [ "$BUGS_HTTP" != "200" ]; then
+            echo "WARNING: Bug fetch failed or empty. Writing empty array."
+            echo "[]" > /tmp/bugs.json
+          else
+            echo "$BUGS_BODY" > /tmp/bugs.json
+          fi
+
+          echo ""
+
+          # --- Fetch failed tests ---
+          echo "=== Fetching test_results (status=fail) ==="
+          FAILS=$(curl -s -w "\n%{http_code}" \
             "${SUPABASE_URL}/rest/v1/test_results?status=eq.fail&select=id,test_item,error_message,severity" \
             -H "apikey: ${SUPABASE_SERVICE_KEY}" \
             -H "Authorization: Bearer ${SUPABASE_SERVICE_KEY}" \
-            -H "Content-Type: application/json")
-          echo "$FAILS" > /tmp/fails.json
-          echo "Fetched $(echo "$FAILS" | jq 'length') failure(s)"
-          echo "::endgroup::"
+            -H "Content-Type: application/json" || true)
+
+          FAILS_HTTP=$(echo "$FAILS" | tail -1)
+          FAILS_BODY=$(echo "$FAILS" | sed '$d')
+
+          echo "FAILS HTTP status: ${FAILS_HTTP}"
+          echo "FAILS response: ${FAILS_BODY}"
+
+          if [ -z "$FAILS_BODY" ] || [ "$FAILS_HTTP" != "200" ]; then
+            echo "WARNING: Fails fetch failed or empty. Writing empty array."
+            echo "[]" > /tmp/fails.json
+          else
+            echo "$FAILS_BODY" > /tmp/fails.json
+          fi
+
+          echo ""
+          echo "=== Temp files written ==="
+          echo "bugs.json: $(wc -c < /tmp/bugs.json) bytes"
+          echo "fails.json: $(wc -c < /tmp/fails.json) bytes"
 
       # ----------------------------------------------------------------
-      # Step 2 — Process data and create GitHub Issues (Node)
+      # Step 2: Process data and create GitHub Issues (Node)
       # ----------------------------------------------------------------
       - name: Triage bugs and create issues
         env:
@@ -100,21 +134,19 @@ jobs:
           const fs = require('fs');
           const { execSync } = require('child_process');
 
-          // ---------------------------------------------------------------
-          // Read fetched data from temp files
-          // ---------------------------------------------------------------
+          // --- Read temp files ---
           let bugs = [];
           let fails = [];
           try { bugs = JSON.parse(fs.readFileSync('/tmp/bugs.json', 'utf8')); } catch(e) { bugs = []; }
           try { fails = JSON.parse(fs.readFileSync('/tmp/fails.json', 'utf8')); } catch(e) { fails = []; }
 
+          console.log(`Loaded ${bugs.length} bug(s), ${fails.length} failure(s)`);
+
           const REPO = process.env.GITHUB_REPOSITORY;
           const SUPABASE_URL = process.env.SUPABASE_URL;
           const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 
-          // ---------------------------------------------------------------
-          // Helper: guess likely file from keywords
-          // ---------------------------------------------------------------
+          // --- Guess likely file from keywords ---
           function guessFile(text) {
             const t = (text || '').toLowerCase();
             if (/landing|slug/.test(t))       return 'app/[slug]/page.tsx';
@@ -126,83 +158,75 @@ jobs:
             return 'app/page.tsx';
           }
 
-          // ---------------------------------------------------------------
-          // Helper: build Claude Code prompt
-          // ---------------------------------------------------------------
+          // --- Build Claude Code prompt ---
           function buildPrompt(title, severity, description, likelyFile) {
-            return `## Claude Code Agent Prompt
-
-          **Bug:** ${title}
-          **Severity:** ${severity}
-          **Likely file:** ${likelyFile}
-
-          ### Description
-          ${description}
-
-          ### Fix Instructions
-          1. Open \`${likelyFile}\` and locate the code related to: ${title}
-          2. Reproduce the issue by reading the logic path described above.
-          3. Implement the fix — keep it minimal and targeted.
-          4. **Constraints (MUST follow):**
-             - Do NOT break any existing functionality.
-             - Support all 9 languages (no, en, es, fr, de, pt, zh, ar, hi).
-             - Maintain the dark/gold theme throughout.
-             - Preserve mobile responsiveness on all viewports.
-          5. Run the build (\\\`npm run build\\\`) and verify zero errors.
-          6. If tests exist for the affected area, run them and confirm they pass.
-
-          > Copy this entire prompt into Claude Code to begin the fix.`;
+            return [
+              '## Claude Code Agent Prompt',
+              '',
+              `**Bug:** ${title}`,
+              `**Severity:** ${severity}`,
+              `**Likely file:** ${likelyFile}`,
+              '',
+              '### Description',
+              description,
+              '',
+              '### Fix Instructions',
+              `1. Open \`${likelyFile}\` and locate the code related to: ${title}`,
+              '2. Reproduce the issue by reading the logic path described above.',
+              '3. Implement the fix — keep it minimal and targeted.',
+              '4. **Constraints (MUST follow):**',
+              '   - Do NOT break any existing functionality.',
+              '   - Support all 9 languages (no, en, es, fr, de, pt, zh, ar, hi).',
+              '   - Maintain the dark/gold theme throughout.',
+              '   - Preserve mobile responsiveness on all viewports.',
+              '5. Run the build (`npm run build`) and verify zero errors.',
+              '6. If tests exist for the affected area, run them and confirm they pass.',
+              '',
+              '> Copy this entire prompt into Claude Code to begin the fix.',
+            ].join('\n');
           }
 
-          // ---------------------------------------------------------------
-          // Helper: check if an open issue with exact title already exists
-          // ---------------------------------------------------------------
+          // --- Check for duplicate open issue ---
           function issueExists(title) {
             try {
               const out = execSync(
                 `gh issue list --repo "${REPO}" --state open --search "${title.replace(/"/g, '\\"')}" --json title`,
                 { encoding: 'utf8' }
               );
-              const issues = JSON.parse(out);
-              return issues.some(i => i.title === title);
+              return JSON.parse(out).some(i => i.title === title);
             } catch {
               return false;
             }
           }
 
-          // ---------------------------------------------------------------
-          // Helper: create a GitHub issue
-          // ---------------------------------------------------------------
+          // --- Create a GitHub issue ---
           function createIssue(title, body, labels) {
-            const tmpBody = '/tmp/issue_body.md';
-            fs.writeFileSync(tmpBody, body);
+            fs.writeFileSync('/tmp/issue_body.md', body);
             execSync(
-              `gh issue create --repo "${REPO}" --title "${title.replace(/"/g, '\\"')}" --body-file "${tmpBody}" --label "${labels}"`,
+              `gh issue create --repo "${REPO}" --title "${title.replace(/"/g, '\\"')}" --body-file /tmp/issue_body.md --label "${labels}"`,
               { stdio: 'inherit' }
             );
           }
 
-          // ---------------------------------------------------------------
-          // Helper: PATCH a Supabase row
-          // ---------------------------------------------------------------
-          function supabasePatch(table, query, body) {
+          // --- PATCH Supabase row (best-effort) ---
+          function supabasePatch(table, query, data) {
             try {
-              execSync(`curl -sf -X PATCH \
-                "${SUPABASE_URL}/rest/v1/${table}?${query}" \
-                -H "apikey: ${SUPABASE_SERVICE_KEY}" \
-                -H "Authorization: Bearer ${SUPABASE_SERVICE_KEY}" \
-                -H "Content-Type: application/json" \
-                -H "Prefer: return=minimal" \
-                -d '${JSON.stringify(body)}'`, { stdio: 'inherit' });
+              execSync(
+                `curl -s -X PATCH "${SUPABASE_URL}/rest/v1/${table}?${query}" ` +
+                `-H "apikey: ${SUPABASE_SERVICE_KEY}" ` +
+                `-H "Authorization: Bearer ${SUPABASE_SERVICE_KEY}" ` +
+                `-H "Content-Type: application/json" ` +
+                `-H "Prefer: return=minimal" ` +
+                `-d '${JSON.stringify(data)}'`,
+                { stdio: 'inherit' }
+              );
             } catch { /* best-effort */ }
           }
 
-          // ---------------------------------------------------------------
-          // 1. Process bug reports
-          // ---------------------------------------------------------------
           let created = 0;
           let skipped = 0;
 
+          // --- Process bug reports ---
           console.log(`\n--- Processing ${bugs.length} bug report(s) ---`);
           for (const bug of bugs) {
             const title = `[BUG] ${bug.title}`;
@@ -216,17 +240,14 @@ jobs:
               continue;
             }
 
-            const body = buildPrompt(bug.title, severity, description, likelyFile);
-            createIssue(title, body, `bug-${severity},auto-triage,agent-ready`);
+            createIssue(title, buildPrompt(bug.title, severity, description, likelyFile), `bug-${severity},auto-triage,agent-ready`);
             console.log(`Created issue: ${title}`);
             created++;
 
             supabasePatch('bug_reports', `id=eq.${bug.id}`, { status: 'triaging' });
           }
 
-          // ---------------------------------------------------------------
-          // 2. Group test failures by test_item
-          // ---------------------------------------------------------------
+          // --- Group test failures by test_item ---
           const groups = {};
           for (const f of fails) {
             const key = f.test_item || 'unknown';
@@ -254,22 +275,19 @@ jobs:
               continue;
             }
 
-            const body = buildPrompt(g.test_item, severity, description, likelyFile);
-            createIssue(title, body, `bug-${severity},auto-triage,agent-ready`);
+            createIssue(title, buildPrompt(g.test_item, severity, description, likelyFile), `bug-${severity},auto-triage,agent-ready`);
             console.log(`Created issue: ${title}`);
             created++;
           }
 
-          // ---------------------------------------------------------------
-          // Summary
-          // ---------------------------------------------------------------
-          console.log(`
-          ========================================
-           SYSTM8 Nightly Triage Complete
-          ========================================
-           Bugs fetched:       ${bugs.length}
-           Test groups:        ${grouped.length}
-           Issues created:     ${created}
-           Duplicates skipped: ${skipped}
-          ========================================`);
+          // --- Summary ---
+          console.log('');
+          console.log('========================================');
+          console.log(' SYSTM8 Nightly Triage Complete');
+          console.log('========================================');
+          console.log(` Bugs fetched:       ${bugs.length}`);
+          console.log(` Test groups:        ${grouped.length}`);
+          console.log(` Issues created:     ${created}`);
+          console.log(` Duplicates skipped: ${skipped}`);
+          console.log('========================================');
           NODESCRIPT
